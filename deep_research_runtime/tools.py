@@ -412,6 +412,40 @@ class ToolsMixin:
         if quality_review:
             lines.extend(["", "quality_review:", json.dumps(quality_review, ensure_ascii=False, indent=2)])
 
+        # Cross-source conflicts (Improvement ④). Pulled from graph_state
+        # since it's part of the live research output and the registry
+        # meta is updated on a coarser cadence. Surface a compact summary
+        # plus the per-section list so users can quickly see which
+        # disagreements made it into the report.
+        section_conflicts = graph_state.get("section_conflicts") if isinstance(graph_state, dict) else None
+        if isinstance(section_conflicts, dict) and section_conflicts:
+            total = sum(len(v) for v in section_conflicts.values() if isinstance(v, list))
+            lines.extend([
+                "",
+                f"section_conflicts: {total} disagreement(s) across {len(section_conflicts)} section(s)",
+                json.dumps(section_conflicts, ensure_ascii=False, indent=2),
+            ])
+
+        # Citation grounding audit (Improvement ④ redesigned). The summary
+        # numbers tell the user: how many sections used the grounded
+        # path, how many fell back, and how many citations were emitted
+        # under structural constraint. The per-section detail (in the
+        # registry meta) shows the kinds of failures encountered.
+        citation_audit = meta.get("citation_audit") if isinstance(meta, dict) else None
+        if isinstance(citation_audit, dict) and citation_audit.get("sections_total"):
+            lines.extend([
+                "",
+                "citation_audit:",
+                f"  sections_grounded: {citation_audit.get('sections_grounded', 0)}/"
+                f"{citation_audit.get('sections_total', 0)}",
+                f"  sections_fallback: {citation_audit.get('sections_fallback', 0)}",
+                f"  citations_total: {citation_audit.get('citations_total', 0)}",
+                f"  invalid_ids_dropped: {citation_audit.get('invalid_ids_dropped', 0)}",
+                f"  ungrounded_paragraphs: {citation_audit.get('ungrounded_paragraphs', 0)}",
+                f"  quote_failures: {citation_audit.get('quote_failures', 0)}",
+                f"  numeric_failures: {citation_audit.get('numeric_failures', 0)}",
+            ])
+
         # Report version info
         versions = await self.store.list_report_versions(task_id)
         if versions:

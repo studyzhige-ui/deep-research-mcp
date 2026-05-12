@@ -194,6 +194,20 @@ class ResearchState(TypedDict, total=False):
     knowledge_cards: Annotated[List[KnowledgeCard], operator.add]
     section_digests: List[SectionDigest]
     conflicts: List[str]
+    # Cross-source conflicts surfaced by conflict_detector.py.
+    # Sparse map ``{section_id: [ConflictRecord, ...]}`` — sections without
+    # detected conflicts are absent rather than mapped to an empty list, so
+    # the writer's "if section in section_conflicts" check is meaningful.
+    section_conflicts: Dict[str, List[Dict[str, Any]]]
+    # Citation grounding audit produced by writer.py while it renders each
+    # section via the structured-JSON path. Aggregates: total citations
+    # emitted, citation IDs the LLM tried to invent (filtered out),
+    # numeric / quote grounding failures, and a per-section breakdown.
+    # When the writer falls back to the legacy free-form path for a
+    # section (e.g. malformed LLM JSON), the per-section entry records
+    # ``"writer_fallback": true`` so callers can see why audit signals
+    # are missing for that section.
+    citation_audit: Dict[str, Any]
     quality_review: Dict[str, object]
     loop_count: int
     route_to: str

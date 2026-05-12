@@ -268,6 +268,36 @@ class Settings:
     # checkpoints. The pruner is opt-in (CLI command), never automatic, so
     # this only affects users who run `deep-research-mcp prune`.
     checkpoint_retention_days: int = int(os.environ.get("DEEP_RESEARCH_CHECKPOINT_RETENTION_DAYS", "30"))
+
+    # ── Grounded citation generation (Improvement ④) ──
+    # When enabled, the writer's per-section call requests STRUCTURED JSON
+    # output where each paragraph names which evidence_ids back it. The
+    # closed-set evidence catalog is passed in the prompt, so the LLM can't
+    # invent citation numbers — they're filtered out at parse time. Failed
+    # JSON parses fall back to the legacy free-form prompt path; we never
+    # block report generation on a writer that misbehaves.
+    enable_grounded_citations: bool = os.environ.get("DEEP_RESEARCH_GROUNDED_CITATIONS", "1") in {"1", "true", "True"}
+
+    # ── Cross-source conflict detection (Improvement ④, prior commit) ──
+    # Detects when two cards in the same section make incompatible claims
+    # and instructs the writer to surface the disagreement instead of
+    # silently picking one. Costs one LLM call per section that has at
+    # least one candidate pair; sections without disagreement signal
+    # never trigger a call.
+    enable_conflict_detection: bool = os.environ.get("DEEP_RESEARCH_CONFLICT_DETECTION", "1") in {"1", "true", "True"}
+    conflict_min_cards: int = int(os.environ.get("DEEP_RESEARCH_CONFLICT_MIN_CARDS", "3"))
+    conflict_max_pairs_per_section: int = int(os.environ.get("DEEP_RESEARCH_CONFLICT_MAX_PAIRS_PER_SECTION", "6"))
+
+    # ── Recency weighting (Improvement ③) ──
+    # When a task's time_scope marks it as time-sensitive, multiply each
+    # document's quality score by an age-decay factor. Older sources still
+    # rank against the floor (0.3) so they aren't excluded outright — they
+    # just no longer outweigh a fresh primary source by virtue of having
+    # more body text.
+    recency_weighting_enabled: bool = os.environ.get("DEEP_RESEARCH_RECENCY_WEIGHTING", "1") in {"1", "true", "True"}
+    recency_half_life_recent_months: int = int(os.environ.get("DEEP_RESEARCH_RECENCY_HALF_LIFE_RECENT_MONTHS", "6"))
+    recency_half_life_current_months: int = int(os.environ.get("DEEP_RESEARCH_RECENCY_HALF_LIFE_CURRENT_MONTHS", "18"))
+    recency_half_life_default_months: int = int(os.environ.get("DEEP_RESEARCH_RECENCY_HALF_LIFE_DEFAULT_MONTHS", "36"))
     # Bound the in-memory mp.Queue feeding the worker so a runaway producer
     # cannot OOM the process. 0 disables the limit (legacy behavior). The
     # default of 64 is enough for ~tens of concurrent research tasks while
@@ -290,6 +320,11 @@ class Settings:
     search_engine_rate_limit: int = int(os.environ.get("DEEP_RESEARCH_SEARCH_RATE_LIMIT", "4"))
     search_retry_backoff_base: float = float(os.environ.get("DEEP_RESEARCH_SEARCH_RETRY_BACKOFF_BASE", "1.5"))
     enable_query_reformulation: bool = os.environ.get("DEEP_RESEARCH_ENABLE_QUERY_REFORMULATION", "1") in {"1", "true", "True"}
+    # Number of strategy-diverse reformulations to request in a single LLM
+    # call when a query returns zero results. Capped at the number of
+    # strategies defined in query_reform.py (currently 5). The default of 3
+    # covers SIMPLIFY/SYNONYMS/DECOMPOSE — the three highest-recall paths.
+    max_reformulation_attempts: int = int(os.environ.get("DEEP_RESEARCH_MAX_REFORMULATION_ATTEMPTS", "3"))
 
     # ── Task ──
     task_execution_timeout: int = int(os.environ.get("DEEP_RESEARCH_TASK_EXECUTION_TIMEOUT", "5400"))

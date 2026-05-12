@@ -26,7 +26,8 @@ import aiohttp
 from langgraph.graph import END, StateGraph
 from langgraph.types import Send
 
-from .agents.base import AgentContext, infer_user_language, sanitize_path_name
+from .agents.base import AgentContext, call_llm_json, infer_user_language, sanitize_path_name
+from .conflict_detector import detect_conflicts_for_state
 from .knowledge_cache import KnowledgeCache
 from .langsmith_utils import trace_chain
 from .models import KnowledgeCard, ResearchState, SectionDigest, SectionResearchInput, SubTask
@@ -471,6 +472,50 @@ def build_graph(service: "DeepResearchService"):
         return {"evidence_outline": outline, "plan_data": plan_data}
 
     # ────────────────────────────────────────────────────────
+    #  Node: Conflict Detector (Improvement ④)
+    #
+    #  Runs after outline_builder, before writer. For each section, looks
+    #  for cards that contradict each other (different stance with shared
+    #  entity, or same entity with diverging numbers). Surfaces findings
+    #  in `section_conflicts` so the writer can phrase disagreement
+    #  explicitly. When the feature flag is off or no conflicts are
+    #  detected, this node is a no-op pass-through.
+    # ────────────────────────────────────────────────────────
+    @trace_chain(name="node_detect_conflicts")
+    async def node_detect_conflicts(state: ResearchState) -> Dict[str, Any]:
+        if not getattr(service.settings, "enable_conflict_detection", True):
+            return {}
+        task_id = state["task_id"]
+        topic = state["topic"]
+        cards = state.get("knowledge_cards", []) if isinstance(state.get("knowledge_cards"), list) else []
+        digests = state.get("section_digests", []) if isinstance(state.get("section_digests"), list) else []
+        if not cards:
+            return {}
+
+        async def _llm(prompt: str, **kwargs: Any) -> Any:
+            return await call_llm_json(service._agent_context, prompt, **kwargs)
+
+        await service.store.append_progress_event(
+            task_id, "conflict_detect_start",
+            message="Scanning sections for cross-source disagreement...",
+        )
+        section_conflicts = await detect_conflicts_for_state(
+            cards, digests,
+            call_llm_json=_llm,
+            min_cards=service.settings.conflict_min_cards,
+            max_pairs=service.settings.conflict_max_pairs_per_section,
+            task_id=task_id, topic=topic,
+        )
+        total = sum(len(v) for v in section_conflicts.values())
+        await service.store.append_progress_event(
+            task_id, "conflict_detect_done",
+            message=f"Conflict scan complete: {total} disagreement(s) across {len(section_conflicts)} section(s).",
+            count=total,
+        )
+        service.save_probe(task_id, topic, "conflict_detector", "section_conflicts", section_conflicts)
+        return {"section_conflicts": section_conflicts}
+
+    # ────────────────────────────────────────────────────────
     #  Node: Writer
     # ────────────────────────────────────────────────────────
     @trace_chain(name="node_writer")
@@ -505,6 +550,7 @@ def build_graph(service: "DeepResearchService"):
     workflow.add_node("collect_results", node_collect_results)
     workflow.add_node("reflector", node_reflector)
     workflow.add_node("outline_builder", node_outline_builder)
+    workflow.add_node("detect_conflicts", node_detect_conflicts)
     workflow.add_node("writer", node_writer)
 
     workflow.set_entry_point("supervisor")
@@ -519,13 +565,26 @@ def build_graph(service: "DeepResearchService"):
     # Reduce → Reflector
     workflow.add_edge("collect_results", "reflector")
 
-    # Reflector routes: loop back to dispatch_sections or build an evidence-based outline before writing.
+    # Reflector routes: loop back to dispatch_sections, run the writer
+    # directly (no outline rebuild), or go through outline_builder first.
+    # The "writer" branch from reflector skips the outline rebuild (used
+    # when nothing changed), so we route through conflict detection
+    # there too via an extra hop in the conditional routing table below.
     workflow.add_conditional_edges(
         "reflector",
         lambda state: state.get("route_to", "writer"),
-        {"outline_builder": "outline_builder", "writer": "writer", "dispatch_sections": "dispatch_sections"},
+        {
+            "outline_builder": "outline_builder",
+            "writer": "detect_conflicts",
+            "dispatch_sections": "dispatch_sections",
+        },
     )
-    workflow.add_edge("outline_builder", "writer")
+    # Both outline_builder and the reflector-direct-to-writer path now
+    # funnel through conflict detection before reaching the writer. That
+    # keeps the writer's contract identical: it always sees a populated
+    # (possibly empty) section_conflicts field.
+    workflow.add_edge("outline_builder", "detect_conflicts")
+    workflow.add_edge("detect_conflicts", "writer")
     workflow.add_edge("writer", END)
 
     return workflow.compile(checkpointer=getattr(service, "graph_checkpointer", None))

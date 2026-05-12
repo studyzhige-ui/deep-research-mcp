@@ -14,6 +14,8 @@ from typing import Any, Dict, List
 import aiohttp
 
 from ..models import KnowledgeCard, SubTask
+from ..query_reform import reformulate_queries
+from ..recency import recency_weight
 from ..retry import compute_backoff_delay
 from ..search_service import SearchService
 from .base import AgentContext, call_llm_json, call_llm_text, sanitize_path_name
@@ -72,10 +74,18 @@ class ResearcherAgent:
                 documents = await self._search_with_retry(session, rewritten_queries, search_profile, semaphore, task_id, topic, task)
 
                 if not documents and self.settings.enable_query_reformulation:
-                    # Tier 2: Query reformulation
-                    alt_query = await self._reformulate_query(query, intent, task_id, topic)
-                    if alt_query and alt_query != query:
-                        documents = await self._search_with_retry(session, [alt_query], search_profile, semaphore, task_id, topic, task)
+                    # Tier 2: Multi-strategy query reformulation. One LLM call
+                    # produces up to N alternatives spanning different
+                    # strategies (simplify / synonyms / decompose / ...); we
+                    # try them in order and early-exit on the first hit.
+                    alt_queries = await self._reformulate_queries(query, intent, task_id, topic)
+                    for alt in alt_queries:
+                        documents = await self._search_with_retry(
+                            session, [alt], search_profile, semaphore, task_id, topic, task
+                        )
+                        if documents:
+                            result["reformulated_query"] = alt
+                            break
 
                 if not documents:
                     # Tier 3: Graceful degradation
@@ -179,19 +189,37 @@ class ResearcherAgent:
                 await asyncio.sleep(delay)
         return []
 
-    # ── Tier 2: Query reformulation ──
+    # ── Tier 2: Multi-strategy query reformulation ──
 
-    async def _reformulate_query(self, query: str, intent: str, task_id: str, topic: str) -> str:
-        prompt = (
-            "The following search query returned zero results. "
-            "Simplify it into a shorter, more general query that is likely to return results.\n"
-            f"Original query: {query}\nIntent: {intent}\n"
-            "Return ONLY the new query text, nothing else."
+    async def _reformulate_queries(
+        self, query: str, intent: str, task_id: str, topic: str
+    ) -> List[str]:
+        """Generate strategy-diverse alternative queries via a single LLM call.
+
+        Returns a list with up to ``settings.max_reformulation_attempts``
+        candidates, ordered by the strategy priority defined in
+        ``query_reform.STRATEGIES``. The caller tries them in order and
+        early-exits on the first non-empty search.
+
+        Delegates the prompt construction and JSON parsing to
+        ``query_reform.reformulate_queries`` so this module stays focused
+        on the search orchestration. The LLM callable is wrapped to bind
+        the agent context, which the helper doesn't need to know about.
+        """
+        max_attempts = max(1, int(self.settings.max_reformulation_attempts))
+
+        async def _bound_llm(prompt: str, **kwargs: Any) -> Any:
+            return await call_llm_json(self.ctx, prompt, **kwargs)
+
+        return await reformulate_queries(
+            query,
+            intent,
+            max_attempts=max_attempts,
+            call_llm_json=_bound_llm,
+            task_id=task_id,
+            topic=topic,
+            stage="researcher",
         )
-        try:
-            return (await call_llm_text(self.ctx, prompt, task_id=task_id, topic=topic, stage="researcher", name="query_reformulation")).strip()
-        except Exception:
-            return ""
 
     # ── Card Extraction ──
 
@@ -232,6 +260,10 @@ class _RetrievalHelper:
         self.ctx = ctx
 
     def dedupe_and_rank_documents(self, docs, task):
+        # Pull task-level time_scope once; it doesn't change between docs
+        # for the same call, and feeding it into ``_score_document`` lets
+        # recency decay see what the user actually asked for.
+        time_scope = str((task or {}).get("time_scope") or "")
         by_url: Dict[str, Dict[str, Any]] = {}
         for document in docs:
             url = str(document.get("url") or "").split("#", 1)[0].rstrip("/")
@@ -242,13 +274,25 @@ class _RetrievalHelper:
             if not candidate["content"]:
                 continue
             existing = by_url.get(url)
-            if existing is None or self._score_document(candidate) > self._score_document(existing):
-                candidate["search_quality_score"] = self._score_document(candidate)
+            if existing is None or self._score_document(candidate, time_scope) > self._score_document(existing, time_scope):
+                candidate["search_quality_score"] = self._score_document(candidate, time_scope)
                 by_url[url] = candidate
         return sorted(by_url.values(), key=lambda item: float(item.get("search_quality_score") or 0.0), reverse=True)
 
-    @staticmethod
-    def _score_document(document: Dict[str, Any]) -> float:
+    def _score_document(self, document: Dict[str, Any], time_scope: str = "") -> float:
+        """Compute the source-quality score used for ranking and dedup tiebreaks.
+
+        Components, in order of contribution:
+
+        1. ``provider_score`` — whatever the search engine returned.
+        2. Body-length bonus — capped at 1.0 to avoid massively long pages
+           winning purely on word count.
+        3. Layer/kind bonuses — vertical (academic) and primary-format
+           (paper/pdf/repo) sources get a fixed boost.
+        4. Recency multiplier — applied last, gated on ``time_scope``.
+           Returns ≤ 1.0 so it only ever de-emphasises stale content; we
+           never *boost* a doc above the additive score on freshness alone.
+        """
         content = str(document.get("content") or "")
         score = float(document.get("score", document.get("provider_score", 0.0)) or 0.0)
         score += min(1.0, len(content) / 3000.0)
@@ -256,6 +300,27 @@ class _RetrievalHelper:
             score += 0.25
         if str(document.get("source_kind") or document.get("page_type") or "") in {"paper", "pdf", "repo"}:
             score += 0.15
+
+        # Recency decay (multiplicative, gated by settings + time_scope).
+        # We attach the weight to the document so downstream consumers
+        # (writer, fidelity check) can inspect *why* one source ranked
+        # higher than another without re-deriving the math.
+        settings = getattr(self.ctx, "settings", None)
+        if settings is not None and getattr(settings, "recency_weighting_enabled", True) and time_scope:
+            published = document.get("published_time") or document.get("year")
+            half_lives = {
+                "recent": settings.recency_half_life_recent_months,
+                "current": settings.recency_half_life_current_months,
+                "current_year": settings.recency_half_life_current_months,
+            }
+            weight = recency_weight(
+                published,
+                time_scope,
+                half_lives_override=half_lives,
+                default_half_life_months=float(settings.recency_half_life_default_months),
+            )
+            document["recency_weight"] = weight
+            score *= weight
         return score
 
     def make_evidence_records(self, query, intent, evidence):
