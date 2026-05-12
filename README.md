@@ -1,57 +1,76 @@
 # Deep Research MCP
 
-An autonomous deep-research engine packaged as a [Model Context Protocol](https://modelcontextprotocol.io) server.
-Give it a topic; it plans, searches, deduplicates evidence, writes a structured Markdown report with verifiable citations, and remembers enough to do incremental follow-up research later.
+Deep Research MCP is a Model Context Protocol server for autonomous, citation-driven research.
 
-Built on **LangGraph** (map-reduce parallel research), **LiteLLM** (any LLM provider), and **FastMCP** (works with Claude Desktop, Claude Code, Cursor, Codex, and any MCP-compatible host).
+It turns a broad research topic into a planned workflow, searches for evidence, deduplicates sources, writes a structured Markdown report, and supports follow-up research against previous reports.
 
----
+## Features
 
-## 5-minute quickstart
+- MCP server over stdio for Claude Desktop, Claude Code, Cursor, Codex, and other MCP-compatible clients
+- Plan-first workflow: draft a research plan before executing the full task
+- Parallel section research with LangGraph
+- LLM provider abstraction through LiteLLM
+- Search integrations for Tavily, Exa, Serper, Bocha, Bing, Google Custom Search, SerpAPI, Searx, DuckDuckGo, Jina Reader, Semantic Scholar, arXiv, and PubMed Central
+- Evidence normalization, deduplication, citation tracking, and report version comparison
+- Local SQLite checkpoints and Markdown report output
+- Optional local embedder and reranker support
 
-### 1. Install
+## MCP Tools
+
+The server exposes these tools:
+
+| Tool | Purpose |
+|---|---|
+| `check_research_runtime` | Check whether the runtime and configuration are usable. |
+| `draft_research_plan` | Create a research plan and return a task ID. |
+| `start_research_task` | Start an approved research task. |
+| `get_research_status` | Inspect progress and task state. |
+| `get_research_result` | Return final report paths, preview, and version history. |
+| `follow_up_research` | Extend a completed report with additional research. |
+| `compare_report_versions` | Compare two report versions. |
+
+## Installation
+
+Clone the repository and install it into a Python environment:
 
 ```bash
-# From a clone of this repository
+git clone https://github.com/studyzhige-ui/deep-research-mcp.git
+cd deep-research-mcp
 pip install -e .
+```
 
-# Optional: local embedder + reranker (used for evidence dedup/rerank).
-# Skip this if you don't have a GPU or don't want the worker subprocess.
+Optional extras:
+
+```bash
+# Local embedding / reranking worker
 pip install -e ".[local-models]"
 
-# Optional: DuckDuckGo fallback + PDF extraction
+# DuckDuckGo fallback and PDF extraction
 pip install -e ".[extras]"
+
+# Development tools
+pip install -e ".[dev]"
 ```
 
-### 2. Generate your client config
-
-Run the interactive wizard — it asks for your API keys and prints a JSON/TOML snippet ready to paste into your MCP client config. **Keys are never written to disk by the wizard**, only shown on screen.
+Verify the command is available:
 
 ```bash
-deep-research-mcp init
+deep-research-mcp doctor
 ```
 
-You will be asked for:
+## MCP Client Configuration
 
-| Field | Required? | Where to get it |
-|---|---|---|
-| LLM provider + API key | yes | DeepSeek / OpenAI / Anthropic / Gemini etc. |
-| Tavily API key | strongly recommended | https://tavily.com (free tier 1000/mo) |
-| Exa / Serper / Bocha | optional | for richer multi-source search |
-| LangSmith API key | optional | for tracing |
-
-### 3. Wire the server into your MCP client
-
-Paste the snippet the wizard produced into your client config. Example for **Claude Desktop / Claude Code** (`~/.claude.json` or platform-specific path):
+Add the server to your MCP client's configuration. The exact file location depends on the client, but the server entry has this shape:
 
 ```json
 {
   "mcpServers": {
     "deep-research": {
       "command": "deep-research-mcp",
+      "args": [],
       "env": {
+        "DEEP_RESEARCH_LLM_MODEL": "deepseek/deepseek-chat",
         "DEEPSEEK_API_KEY": "YOUR_DEEPSEEK_API_KEY",
-        "DEEP_RESEARCH_LLM_MODEL": "deepseek/deepseek-v4-flash",
         "TAVILY_API_KEY": "YOUR_TAVILY_API_KEY"
       }
     }
@@ -59,145 +78,121 @@ Paste the snippet the wizard produced into your client config. Example for **Cla
 }
 ```
 
-For **Codex** (`~/.codex/config.toml`):
+For TOML-based clients:
 
 ```toml
 [mcp_servers.deep-research]
 command = "deep-research-mcp"
-env = { DEEPSEEK_API_KEY = "YOUR_DEEPSEEK_API_KEY", TAVILY_API_KEY = "YOUR_TAVILY_API_KEY" }
+args = []
+
+[mcp_servers.deep-research.env]
+DEEP_RESEARCH_LLM_MODEL = "deepseek/deepseek-chat"
+DEEPSEEK_API_KEY = "YOUR_DEEPSEEK_API_KEY"
+TAVILY_API_KEY = "YOUR_TAVILY_API_KEY"
 ```
 
-For **Cursor** (`~/.cursor/mcp.json`): same JSON shape as Claude.
+Restart the MCP client after changing its configuration.
 
-Restart your MCP client. The seven `deep-research` tools should appear in the tool picker.
+## Configuration
 
-### 4. Verify
+Configuration is provided through environment variables. Do not commit API keys to this repository.
 
-```bash
-# Confirm your env vars are picked up correctly (no server start, no LLM calls).
-deep-research-mcp doctor
-```
-
-You should see a summary like:
-
-```
-[deep-research] [OK] LLM model=deepseek/deepseek-v4-flash (key via DEEP_RESEARCH_LLM_API_KEY)
-[deep-research] [OK] Search engines active: tavily
-[deep-research] [SKIP] exa: EXA_API_KEY not set
-```
-
----
-
-## How users interact with it
-
-From inside any MCP-compatible chat client:
-
-1. **Draft a plan**
-   `draft_research_plan(topic, background_intent)` → returns a task id + proposed outline.
-2. **Approve and run**
-   `start_research_task(task_id)` → kicks off background execution.
-3. **Check progress**
-   `get_research_status(task_id)` → real-time timeline of section_start / section_done / retry events.
-4. **Get the report**
-   `get_research_result(task_id)` → final Markdown path + preview + version history.
-5. **Iterate**
-   `follow_up_research(task_id, question)` → incremental research on a completed report.
-6. **Compare**
-   `compare_report_versions(task_id, va, vb)` → section-by-section diff.
-
----
-
-## Configuration reference
-
-All settings are read from environment variables — pass them via your MCP client's `env` field.
-
-### Required
+### LLM
 
 | Variable | Description |
 |---|---|
-| `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / etc. | LLM provider key. LiteLLM auto-detects based on `DEEP_RESEARCH_LLM_MODEL`. |
-| `TAVILY_API_KEY` | Primary search engine. Without this you'll fall back to DuckDuckGo only. |
+| `DEEP_RESEARCH_LLM_MODEL` | LiteLLM model identifier, such as `deepseek/deepseek-chat`, `openai/gpt-4.1-mini`, or `anthropic/claude-3-5-sonnet`. |
+| `DEEP_RESEARCH_LLM_API_KEY` | Optional generic LLM API key. Provider-specific variables are also supported by LiteLLM. |
+| `DEEP_RESEARCH_LLM_BASE_URL` | Optional custom API base URL. |
+| `DEEP_RESEARCH_PLANNER_MODEL` | Optional model override for planning. |
+| `DEEP_RESEARCH_RESEARCHER_MODEL` | Optional model override for research. |
+| `DEEP_RESEARCH_WRITER_MODEL` | Optional model override for writing. |
+| `DEEP_RESEARCH_REVIEWER_MODEL` | Optional model override for review. |
 
-### LLM tuning
-
-| Variable | Default | Description |
-|---|---|---|
-| `DEEP_RESEARCH_LLM_MODEL` | `deepseek/deepseek-v4-flash` | LiteLLM model identifier. |
-| `DEEP_RESEARCH_PLANNER_MODEL` | (same as above) | Override per agent role. |
-| `DEEP_RESEARCH_RESEARCHER_MODEL` | (same) | |
-| `DEEP_RESEARCH_WRITER_MODEL` | (same) | |
-| `DEEP_RESEARCH_REVIEWER_MODEL` | (same) | |
+Provider-specific keys include `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and any other variable supported by LiteLLM for the selected model.
 
 ### Search
 
-| Variable | Default | Description |
-|---|---|---|
-| `TAVILY_API_KEY` | — | Primary engine. |
-| `EXA_API_KEY` | — | Neural semantic search. |
-| `SERPER_API_KEY` | — | Google Search wrapper. |
-| `BOCHA_API_KEY` | — | Chinese-language semantic search. |
-| `JINA_API_KEY` | — | Jina Reader for JS-heavy pages (works without key in degraded mode). |
-| `DEEP_RESEARCH_MULTI_SOURCE` | `0` | Set to `1` to aggregate every configured engine instead of Tavily-only. |
-| `DEEP_RESEARCH_DUCKDUCKGO_FALLBACK` | `1` | Free fallback when nothing else is configured. |
+| Variable | Description |
+|---|---|
+| `TAVILY_API_KEY` | Primary web search provider. |
+| `EXA_API_KEY` | Optional Exa neural search provider. |
+| `SERPER_API_KEY` | Optional Serper search provider. |
+| `BOCHA_API_KEY` | Optional Bocha search provider. |
+| `JINA_API_KEY` | Optional Jina Reader key for page extraction. |
+| `SERPAPI_API_KEY` | Optional SerpAPI provider. |
+| `BING_API_KEY` | Optional Bing Web Search provider. |
+| `GOOGLE_API_KEY` | Optional Google Custom Search API key. |
+| `GOOGLE_CSE_ID` | Google Custom Search engine ID. |
+| `SEARX_BASE_URL` | Optional Searx/SearxNG instance URL. |
+| `DEEP_RESEARCH_MULTI_SOURCE` | Set to `1` to aggregate all configured search providers. |
+| `DEEP_RESEARCH_DUCKDUCKGO_FALLBACK` | Set to `1` to use DuckDuckGo when available. |
 
-### Vertical sources
+### Academic Sources
 
-| Variable | Default | Description |
-|---|---|---|
-| `DEEP_RESEARCH_ACADEMIC_SEARCH` | `0` | Enable Semantic Scholar. |
-| `DEEP_RESEARCH_ARXIV_SEARCH` | `0` | Enable arXiv (requires academic search on). |
-| `DEEP_RESEARCH_PUBMED_SEARCH` | `0` | Enable PubMed (requires academic search on). |
+| Variable | Description |
+|---|---|
+| `DEEP_RESEARCH_ACADEMIC_SEARCH` | Enable academic search routing. |
+| `DEEP_RESEARCH_ARXIV_SEARCH` | Enable arXiv search. |
+| `DEEP_RESEARCH_PUBMED_SEARCH` | Enable PubMed Central search. |
 
-### Observability (optional)
+### Runtime
 
-| Variable | Default | Description |
-|---|---|---|
-| `LANGSMITH_API_KEY` | — | Enables LangSmith tracing. |
-| `LANGCHAIN_PROJECT` | `DeepResearch` | Project name in the LangSmith dashboard. |
+| Variable | Description |
+|---|---|
+| `DEEP_RESEARCH_REPORT_DIR` | Directory for generated reports and checkpoints. |
+| `DEEP_RESEARCH_EMBEDDER_PATH` | Local embedding model path or model name. |
+| `DEEP_RESEARCH_RERANKER_PATH` | Local reranker model path or model name. |
+| `DEEP_RESEARCH_TASK_EXECUTION_TIMEOUT` | Maximum task runtime in seconds. |
+| `DEEP_RESEARCH_DEBUG_TRACE` | Set to `1` for additional debug output. |
 
-### Output & runtime
+### Observability
 
-| Variable | Default | Description |
-|---|---|---|
-| `DEEP_RESEARCH_REPORT_DIR` | `~/Desktop/DeepResearch` | Where final reports are saved. |
-| `DEEP_RESEARCH_EMBEDDER_PATH` | `~/.cache/deep_research/models/bge-small-zh-v1.5` | Local embedder. Downloaded on first use if absent. |
-| `DEEP_RESEARCH_RERANKER_PATH` | `~/.cache/deep_research/models/bge-reranker-base` | Local reranker. |
+| Variable | Description |
+|---|---|
+| `LANGSMITH_API_KEY` | Optional LangSmith tracing key. |
+| `LANGCHAIN_PROJECT` | LangSmith project name. |
 
----
+## Usage
 
-## Architecture (one paragraph)
+Inside an MCP-compatible client, a typical workflow is:
 
-The server is a LangGraph state machine: `supervisor → dispatch_sections → section_researcher × N → collect_results → reflector → outline_builder → writer`. Each section runs in parallel via LangGraph's `Send()` API. Evidence collected by researchers is stored as `KnowledgeCard` objects, deduplicated both by URL (exact) and by claim similarity (semantic, threshold 0.85). The reflector decides whether to loop for more evidence or stop based on a saturation metric. Output is structured Markdown with numbered citations linking back to the source catalog. Full architecture details live in [`docs/PROJECT_DOCUMENTATION.md`](docs/PROJECT_DOCUMENTATION.md).
+1. Call `draft_research_plan` with a topic and background intent.
+2. Review the proposed plan.
+3. Call `start_research_task` with the returned task ID.
+4. Poll `get_research_status`.
+5. Call `get_research_result` when the task completes.
+6. Use `follow_up_research` or `compare_report_versions` when needed.
 
----
+Example user prompt:
 
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Server starts but reports `No search engine is available` | No keys set, DuckDuckGo disabled | Set `TAVILY_API_KEY` or `DEEP_RESEARCH_DUCKDUCKGO_FALLBACK=1` |
-| `Model worker failed to start` | Missing `sentence-transformers` / `torch` | `pip install -e ".[local-models]"` |
-| LLM calls fail with "API key not found" | Provider key not set in client `env` | Add `DEEPSEEK_API_KEY` (or your provider's key) to client config |
-| Reports save somewhere unexpected | `DEEP_RESEARCH_REPORT_DIR` defaults to `~/Desktop/DeepResearch` | Override with the env var |
-
-Run `deep-research-mcp doctor` whenever something looks off — it prints exactly which engines are active and why others were skipped.
-
----
-
-## Security notes
-
-- **API keys live in the user's MCP client config, never in this repository.** The maintainers ship no embedded keys; if a fork ever does, treat them as already-leaked.
-- The MCP server uses stdio transport by default — no network listener is exposed. Don't run it behind an HTTP transport on a public network without adding authentication first.
-- Reports and checkpoints are stored as plaintext under `DEEP_RESEARCH_REPORT_DIR`. Don't point this at a synced folder if your research topics are sensitive.
-
----
+```text
+Use deep-research to draft a plan for researching recent progress in RISC-V adoption in data centers.
+```
 
 ## Development
 
+Run tests:
+
 ```bash
-pip install -e ".[dev]"
 pytest
+```
+
+Run linting:
+
+```bash
 ruff check .
 ```
 
-See [`docs/PROJECT_DOCUMENTATION.md`](docs/PROJECT_DOCUMENTATION.md) for architecture deep-dives and [`docs/INTERVIEW_QA.md`](docs/INTERVIEW_QA.md) for design rationale.
+The main entry point is `deep_research_mcp.py`. Runtime code lives in `deep_research_runtime/`, and tests live in `tests/`.
+
+## Security
+
+- API keys must be provided by the user through environment variables or MCP client configuration.
+- This repository does not include API keys, local credentials, private configuration files, generated checkpoints, or generated reports.
+- The default MCP transport is stdio. Do not expose the server over a public network without adding an authentication layer.
+- Generated reports and checkpoints may contain sensitive research content. Store `DEEP_RESEARCH_REPORT_DIR` accordingly.
+
+## License
+
+MIT
