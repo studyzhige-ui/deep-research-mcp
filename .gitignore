@@ -1,0 +1,52 @@
+# ──────────────────────────────────────────────────────────────────────
+# Deep Research MCP — gitignore
+# ──────────────────────────────────────────────────────────────────────
+
+# Secrets — these MUST NEVER be committed.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+config.local.json
+secrets/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local data
+.cache/
+.local/
+DeepResearch_*.sqlite
+DeepResearch_*.log
+*.log
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Runtime artifacts
+runtime/
+checkpoints/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
