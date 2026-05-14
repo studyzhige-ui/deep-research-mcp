@@ -500,7 +500,7 @@ class WriterAgent:
         ctx = self.ctx
 
         await ctx.store.append_task_event(task_id, "writer", "Writing the final evidence-grounded report package.")
-        await ctx.store.set_status(task_id, "Stage 4/4: writing the final evidence-grounded report.", lifecycle="running", stage="writer")
+        await ctx.store.set_status(task_id, "Stage 4/5: writing the final evidence-grounded report.", lifecycle="running", stage="writer")
         ctx.log_task(task_id, "Writer started.", stage="writer")
 
         task_dir = get_task_output_dir(task_id, topic)

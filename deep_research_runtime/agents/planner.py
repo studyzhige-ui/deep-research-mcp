@@ -329,9 +329,8 @@ class PlannerAgent:
                     "section_goal": goal,
                     "section_order": order,
                     "priority": priority,
-                    "source_strategy": list(item.get("verticals", [])) if isinstance(item.get("verticals"), list) else [],
+                    "verticals": list(item.get("verticals", [])) if isinstance(item.get("verticals"), list) else [],
                     "source_types": list(item.get("source_types", [])) if isinstance(item.get("source_types"), list) else [],
-                    "extraction_fields": list(item.get("extraction_fields", [])) if isinstance(item.get("extraction_fields"), list) else [],
                     "status": "pending",
                 })
         return sub_tasks
@@ -741,21 +740,13 @@ class PlannerAgent:
 
     @staticmethod
     def _dedupe_text_values(values: List[str]) -> List[str]:
-        seen = set()
-        result: List[str] = []
-        for item in values:
-            cleaned = str(item or "").strip()
-            if not cleaned:
-                continue
-            key = cleaned.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(cleaned)
-        return result
+        # Shim → :func:`agents.base.dedupe_preserving_order`.
+        from .base import dedupe_preserving_order
+        return dedupe_preserving_order(values)
 
     def _dedupe_limited(self, values: List[str], limit: int) -> List[str]:
-        return self._dedupe_text_values(values)[:max(1, limit)]
+        from .base import dedupe_preserving_order
+        return dedupe_preserving_order(values, limit=max(1, limit))
 
     @staticmethod
     def _strip_query_surface(text: str) -> str:

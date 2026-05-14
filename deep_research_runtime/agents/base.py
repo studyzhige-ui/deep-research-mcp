@@ -22,6 +22,48 @@ from ..storage import TaskRegistryStore, now_iso
 logger = logging.getLogger("DeepResearchMCP")
 
 
+def dedupe_preserving_order(
+    values: List[Any],
+    *,
+    limit: Optional[int] = None,
+    collapse_whitespace: bool = False,
+) -> List[str]:
+    """Case-insensitive, order-preserving dedupe.
+
+    Single replacement for the five near-identical helpers that previously
+    lived in ``planner._dedupe_text_values`` / ``_dedupe_limited``,
+    ``researcher._dedupe_text_values``, ``quality._dedupe_text_items`` and
+    ``query_reform._dedupe_preserving_order``.
+
+    Parameters
+    ----------
+    values:
+        Iterable of items to clean and dedupe. Each is coerced to ``str``
+        and stripped; empty results are dropped.
+    limit:
+        If set and > 0, the result is truncated to this many entries.
+    collapse_whitespace:
+        When ``True``, internal runs of whitespace are collapsed to a single
+        space (matches the old ``quality._dedupe_text_items`` behavior).
+    """
+    seen: set = set()
+    out: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if collapse_whitespace:
+            text = re.sub(r"\s+", " ", text)
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if limit and limit > 0 and len(out) >= limit:
+            break
+    return out
+
+
 @dataclass
 class AgentContext:
     """Dependency container injected into every agent.

@@ -54,6 +54,90 @@ class ToolsMixin:
         values = getattr(snapshot, "values", None)
         return values if isinstance(values, dict) else {}
 
+    def _spawn_background(
+        self,
+        *,
+        task_id: str,
+        topic: str,
+        coro_factory,
+        kind: str,
+        timing_name: str,
+        task_name: str,
+        completion_msg: str,
+        completion_event: str,
+        cancelled_msg: str,
+        cancelled_event: str,
+        failure_event: str,
+        classify_errors: bool = True,
+    ) -> None:
+        """Spawn ``coro_factory()`` as a tracked background task.
+
+        Centralizes the CancelledError / Exception / success bookkeeping that
+        used to be duplicated across ``tool_execute_plan`` and
+        ``tool_follow_up_research`` (~110 lines of near-identical try/except
+        plumbing). Each branch routes through ``store.finalize_task`` so the
+        registry sees a single atomic write instead of the old triple of
+        save_task_meta + append_task_event + set_status.
+        """
+
+        async def runner() -> None:
+            started_at = time.perf_counter()
+            try:
+                await asyncio.wait_for(coro_factory(), timeout=self.settings.task_execution_timeout)
+            except asyncio.CancelledError:
+                self.log_task(task_id, f"{kind} cancelled.", level="warning")
+                await self.store.finalize_task(
+                    task_id, "cancelled",
+                    status_msg=cancelled_msg,
+                    event_msg=cancelled_event,
+                )
+                raise
+            except Exception as exc:
+                error_message = str(exc).strip() or exc.__class__.__name__
+                error_code = self.classify_error(exc) if classify_errors else ""
+                exception_type = f"{exc.__class__.__module__}.{exc.__class__.__name__}"
+                # Bound traceback size — uncapped tracebacks with LLM payloads
+                # can balloon and bloat the SQLite registry.
+                traceback_text = traceback.format_exc()
+                if len(traceback_text) > 16000:
+                    traceback_text = traceback_text[:8000] + "\n... [truncated] ...\n" + traceback_text[-8000:]
+                self.log_task(
+                    task_id, f"{kind} failed.", level="error",
+                    error_code=error_code, error=error_message,
+                )
+                self.save_probe(
+                    task_id, topic, "task", f"{kind}_error",
+                    {
+                        "error": error_message,
+                        "error_code": error_code,
+                        "exception_type": exception_type,
+                        "traceback": traceback_text,
+                    },
+                )
+                await self.store.finalize_task(
+                    task_id, "failed",
+                    status_msg=f"{kind.capitalize()} failed: {error_message}",
+                    event_msg=failure_event,
+                    error=error_message,
+                    error_code=error_code,
+                    exception_type=exception_type,
+                    traceback=traceback_text,
+                )
+            else:
+                final_meta = await self.store.load_task_meta(task_id)
+                if str(final_meta.get("lifecycle") or "") != "completed":
+                    await self.store.finalize_task(
+                        task_id, "completed",
+                        status_msg=completion_msg,
+                        event_msg=completion_event,
+                    )
+                self.log_task(task_id, f"{kind} finished.")
+            finally:
+                self.record_timing(task_id, topic, "task", timing_name, started_at)
+                self._active_background_tasks.pop(task_id, None)
+
+        self._active_background_tasks[task_id] = asyncio.create_task(runner(), name=task_name)
+
     @trace_tool(name="draft_research_plan")
     async def tool_draft_plan(self, topic: str, background_intent: str) -> str:
         try:
@@ -64,7 +148,7 @@ class ToolsMixin:
                 max_length=MAX_BACKGROUND_LENGTH,
             )
         except ValueError as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return f"error: {exc}"
         task_id = str(uuid.uuid4())[:8]
         output_language = infer_user_language(topic, background_intent)
         self.ensure_report_dir()
@@ -165,7 +249,7 @@ class ToolsMixin:
         return "\n".join(lines)
 
     @trace_tool(name="start_research_task")
-    async def tool_execute_plan(self, task_id: str, user_feedback: str = "approve") -> str:
+    async def tool_execute_plan(self, task_id: str, plan_adjustments: str = "") -> str:
         meta = await self.store.load_task_meta(task_id)
         if not meta:
             return f"Task `{task_id}` was not found."
@@ -180,7 +264,7 @@ class ToolsMixin:
         plan_data = meta.get("plan_data") if isinstance(meta.get("plan_data"), dict) else {}
         execution_plan = meta.get("execution_plan") if isinstance(meta.get("execution_plan"), dict) else {}
         reconnaissance = meta.get("reconnaissance") if isinstance(meta.get("reconnaissance"), dict) else {}
-        output_language = str(meta.get("output_language") or infer_user_language(topic, user_feedback))
+        output_language = str(meta.get("output_language") or infer_user_language(topic, plan_adjustments))
         lifecycle = str(meta.get("lifecycle") or "")
         if lifecycle in {"completed", "cancelled"}:
             return f"Task `{task_id}` is already `{lifecycle}`."
@@ -195,7 +279,7 @@ class ToolsMixin:
                 "plan_data": plan_data,
                 "execution_plan": execution_plan,
                 "reconnaissance": reconnaissance,
-                "user_feedback": user_feedback,
+                "plan_adjustments": plan_adjustments,
                 "output_language": output_language,
                 "lifecycle": "running",
                 "stage": "startup",
@@ -207,9 +291,9 @@ class ToolsMixin:
                 "task_registry_path": str(getattr(self.store, "registry_path", "")),
             },
         )
-        await self.store.append_task_event(task_id, "startup", "Task approved and queued for background execution.", user_feedback=user_feedback)
-        await self.store.set_status(task_id, "Stage 0/4: task accepted and queued.", lifecycle="running", stage="startup")
-        self.log_task(task_id, "Task approved and queued.", stage="startup", user_feedback=user_feedback)
+        await self.store.append_task_event(task_id, "startup", "Task approved and queued for background execution.", plan_adjustments=plan_adjustments)
+        await self.store.set_status(task_id, "Stage 0/5: task accepted and queued.", lifecycle="running", stage="startup")
+        self.log_task(task_id, "Task approved and queued.", stage="startup", plan_adjustments=plan_adjustments)
 
         await self.ensure_graph_ready()
         graph_config = self._graph_config(task_id)
@@ -221,11 +305,10 @@ class ToolsMixin:
             "plan_data": plan_data,
             "execution_plan": execution_plan,
             "reconnaissance": reconnaissance,
-            "user_feedback": user_feedback,
+            "plan_adjustments": plan_adjustments,
             "sub_tasks": [],
             "knowledge_cards": [],
             "section_digests": [],
-            "conflicts": [],
             "quality_review": {},
             "loop_count": 0,
             "route_to": "supervisor",
@@ -233,74 +316,23 @@ class ToolsMixin:
             "section_results": [],
         }
 
-        async def consume_graph() -> None:
+        async def run_graph() -> None:
             with self._langsmith_graph_context(task_id=task_id, topic=topic):
                 await self._run_graph_stream(initial_state, graph_config)
 
-        async def run_graph() -> None:
-            graph_started_at = time.perf_counter()
-            try:
-                await asyncio.wait_for(consume_graph(), timeout=self.settings.task_execution_timeout)
-            except asyncio.CancelledError:
-                self.log_task(task_id, "Background task cancelled.", level="warning", stage="cancelled")
-                await self.store.save_task_meta(task_id, {"lifecycle": "cancelled", "stage": "cancelled", "cancelled_at": now_iso()})
-                await self.store.append_task_event(task_id, "cancelled", "Task execution cancelled.", level="warning")
-                await self.store.set_status(task_id, "Task was cancelled.", lifecycle="cancelled", stage="cancelled")
-                raise
-            except Exception as exc:
-                error_code = self.classify_error(exc)
-                error_message = str(exc).strip() or exc.__class__.__name__
-                # Capture the full traceback so post-mortem debugging doesn't
-                # require re-running the failing scenario. We bound the size
-                # because Python tracebacks can balloon when LLM payloads or
-                # large dicts are involved, and a 10MB traceback would bloat
-                # the sqlite registry.
-                traceback_text = traceback.format_exc()
-                if len(traceback_text) > 16000:
-                    traceback_text = traceback_text[:8000] + "\n... [truncated] ...\n" + traceback_text[-8000:]
-                exception_type = f"{exc.__class__.__module__}.{exc.__class__.__name__}"
-                self.log_task(task_id, "Background task failed.", level="error", stage="failed", error_code=error_code, error=error_message)
-                self.save_probe(
-                    task_id, topic, "task", "task_error",
-                    {
-                        "error": error_message,
-                        "error_code": error_code,
-                        "exception_type": exception_type,
-                        "traceback": traceback_text,
-                    },
-                )
-                await self.store.save_task_meta(
-                    task_id,
-                    {
-                        "lifecycle": "failed",
-                        "stage": "failed",
-                        "error": error_message,
-                        "error_code": error_code,
-                        "exception_type": exception_type,
-                        "failed_at": now_iso(),
-                    },
-                )
-                await self.store.append_task_event(
-                    task_id, "failed", "Task execution failed.",
-                    level="error",
-                    error=error_message,
-                    error_code=error_code,
-                    exception_type=exception_type,
-                    traceback=traceback_text,
-                )
-                await self.store.set_status(task_id, f"Task failed: {error_message}", lifecycle="failed", stage="failed", error=error_message, error_code=error_code)
-            else:
-                final_meta = await self.store.load_task_meta(task_id)
-                if str(final_meta.get("lifecycle") or "") != "completed":
-                    await self.store.save_task_meta(task_id, {"lifecycle": "completed", "stage": "completed", "completed_at": now_iso()})
-                    await self.store.append_task_event(task_id, "completed", "Task execution finished.")
-                    await self.store.set_status(task_id, "Task completed.", lifecycle="completed", stage="completed")
-                self.log_task(task_id, "Background task finished.", stage="completed")
-            finally:
-                self.record_timing(task_id, topic, "task", "task_total", graph_started_at)
-                self._active_background_tasks.pop(task_id, None)
-
-        self._active_background_tasks[task_id] = asyncio.create_task(run_graph(), name=f"deep_research_{task_id}")
+        self._spawn_background(
+            task_id=task_id,
+            topic=topic,
+            coro_factory=run_graph,
+            kind="task",
+            timing_name="task_total",
+            task_name=f"deep_research_{task_id}",
+            completion_msg="Task completed.",
+            completion_event="Task execution finished.",
+            cancelled_msg="Task was cancelled.",
+            cancelled_event="Task execution cancelled.",
+            failure_event="Task execution failed.",
+        )
         return (
             "Research task handed off successfully.\n"
             f"task_id: `{task_id}`\n"
@@ -470,7 +502,7 @@ class ToolsMixin:
                 max_length=MAX_FOLLOW_UP_LENGTH,
             )
         except ValueError as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return f"error: {exc}"
         meta = await self.store.load_task_meta(task_id)
         if not meta:
             return f"Task `{task_id}` was not found."
@@ -532,53 +564,24 @@ class ToolsMixin:
             "previous_coverage": 0.0,
         }
 
-        async def consume_follow_up() -> None:
+        async def run_follow_up() -> None:
             with self._langsmith_graph_context(task_id=task_id, topic=topic):
                 await self._run_graph_stream(incremental_state, graph_config)
 
-        async def run_follow_up() -> None:
-            graph_started_at = time.perf_counter()
-            try:
-                await asyncio.wait_for(consume_follow_up(), timeout=self.settings.task_execution_timeout)
-            except asyncio.CancelledError:
-                await self.store.set_status(task_id, "Follow-up cancelled.", lifecycle="cancelled")
-                raise
-            except Exception as exc:
-                error_msg = str(exc).strip() or exc.__class__.__name__
-                # Same traceback-capture treatment as the primary task path
-                # so follow-ups are equally debuggable after the fact.
-                traceback_text = traceback.format_exc()
-                if len(traceback_text) > 16000:
-                    traceback_text = traceback_text[:8000] + "\n... [truncated] ...\n" + traceback_text[-8000:]
-                exception_type = f"{exc.__class__.__module__}.{exc.__class__.__name__}"
-                self.log_task(task_id, "Follow-up failed.", level="error", stage="failed", error=error_msg)
-                await self.store.save_task_meta(
-                    task_id,
-                    {
-                        "lifecycle": "failed",
-                        "error": error_msg,
-                        "exception_type": exception_type,
-                        "failed_at": now_iso(),
-                    },
-                )
-                await self.store.append_task_event(
-                    task_id, "failed", "Follow-up execution failed.",
-                    level="error",
-                    error=error_msg,
-                    exception_type=exception_type,
-                    traceback=traceback_text,
-                )
-                await self.store.set_status(task_id, f"Follow-up failed: {error_msg}", lifecycle="failed")
-            else:
-                final_meta = await self.store.load_task_meta(task_id)
-                if str(final_meta.get("lifecycle") or "") != "completed":
-                    await self.store.save_task_meta(task_id, {"lifecycle": "completed", "stage": "completed", "completed_at": now_iso()})
-                    await self.store.set_status(task_id, "Follow-up completed.", lifecycle="completed")
-            finally:
-                self.record_timing(task_id, topic, "task", "follow_up_total", graph_started_at)
-                self._active_background_tasks.pop(task_id, None)
-
-        self._active_background_tasks[task_id] = asyncio.create_task(run_follow_up(), name=f"follow_up_{task_id}")
+        self._spawn_background(
+            task_id=task_id,
+            topic=topic,
+            coro_factory=run_follow_up,
+            kind="follow_up",
+            timing_name="follow_up_total",
+            task_name=f"follow_up_{task_id}",
+            completion_msg="Follow-up completed.",
+            completion_event="Follow-up execution finished.",
+            cancelled_msg="Follow-up cancelled.",
+            cancelled_event="Follow-up cancelled.",
+            failure_event="Follow-up execution failed.",
+            classify_errors=False,
+        )
         return (
             "Follow-up research started.\n"
             f"task_id: `{task_id}`\n"
@@ -591,13 +594,17 @@ class ToolsMixin:
     async def tool_compare_versions(self, task_id: str, version_a: int = 0, version_b: int = 0) -> str:
         """Compare two versions of a research report.
 
-        version_a and version_b default to the two most recent versions.
-        Returns a section-by-section diff summary.
+        Versions are 1-indexed. ``version_a <= 0`` or ``version_b <= 0`` is
+        interpreted as "auto-select"; when both are ``<= 0`` the two most
+        recent versions are compared. Returns a section-by-section diff
+        summary.
         """
         versions = await self.store.list_report_versions(task_id)
         if len(versions) < 2:
             return f"Task `{task_id}` has {len(versions)} version(s). Need at least 2 to compare."
 
+        # Auto-select: 0 (or anything <= 0) means "latest two" — versions are
+        # 1-indexed in storage, so 0 is never a real version number.
         if version_a <= 0 or version_b <= 0:
             version_a = versions[-2]["version"]
             version_b = versions[-1]["version"]
@@ -646,6 +653,60 @@ class ToolsMixin:
                 sign = "+" if diff_chars > 0 else ""
                 lines.append(f"  {heading}: [MODIFIED] ({sign}{diff_chars} chars)")
 
+        return "\n".join(lines)
+
+    @trace_tool(name="cancel_research_task")
+    async def tool_cancel(self, task_id: str) -> str:
+        """Cancel a running research task.
+
+        Looks up the in-process background task handle and calls
+        ``Task.cancel()``. The run loop catches ``asyncio.CancelledError``
+        and persists ``lifecycle=cancelled`` to the registry. Cancellation
+        is best-effort: a node that is already blocked inside a non-async
+        call cannot be interrupted until it yields.
+        """
+        meta = await self.store.load_task_meta(task_id)
+        if not meta:
+            return f"Task `{task_id}` was not found."
+        lifecycle = str(meta.get("lifecycle") or "")
+        if lifecycle in {"completed", "cancelled", "failed"}:
+            return f"Task `{task_id}` is already `{lifecycle}`; nothing to cancel."
+        bg = self._active_background_tasks.get(task_id)
+        if bg is None:
+            # No live task handle in this process — the task may have been
+            # started in a previous server run. Mark it cancelled in the
+            # registry so the status reflects the user's intent.
+            await self.store.finalize_task(
+                task_id, "cancelled",
+                status_msg="Task was cancelled.",
+                event_msg="Task marked cancelled (no live runner).",
+            )
+            return f"Task `{task_id}` had no live runner; marked as cancelled in the registry."
+        bg.cancel()
+        return f"Cancellation requested for task `{task_id}`."
+
+    @trace_tool(name="list_research_tasks")
+    async def tool_list_tasks(self, limit: int = 20, lifecycle: str = "") -> str:
+        """List recent research tasks.
+
+        ``limit`` is clamped to [1, 100]. ``lifecycle`` filters to a single
+        lifecycle value (e.g. ``running``, ``completed``, ``failed``,
+        ``cancelled``, ``draft``); empty string returns all.
+        """
+        clamped = max(1, min(int(limit) if isinstance(limit, int) else 20, 100))
+        rows = await self.store.list_tasks_with_meta(limit=clamped, lifecycle=str(lifecycle or ""))
+        if not rows:
+            filt = f" (lifecycle={lifecycle})" if lifecycle else ""
+            return f"task_count: 0{filt}"
+        lines = [f"task_count: {len(rows)}"]
+        for r in rows:
+            topic = r["topic"]
+            if len(topic) > 80:
+                topic = topic[:77] + "..."
+            lines.append(
+                f"- `{r['task_id']}` [{r['lifecycle'] or 'unknown'}/{r['stage'] or '-'}] "
+                f"{topic} (updated {r['updated_at']})"
+            )
         return "\n".join(lines)
 
     @trace_chain(name="graph_background_execution")

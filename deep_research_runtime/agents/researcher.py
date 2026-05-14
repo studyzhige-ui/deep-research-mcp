@@ -62,7 +62,7 @@ class ResearcherAgent:
             query = str(task["query"])
             intent = str(task["intent"])
             task_key = f"{intent}::{query}"
-            result: SubTask = {**task, "status": "failed", "result_count": 0, "searched_urls": [], "retry_count": 0}
+            result: SubTask = {**task, "status": "failed", "result_count": 0, "searched_urls": []}
 
             rewritten_queries = [str(q).strip() for q in task.get("rewritten_queries", []) if str(q).strip()] if isinstance(task.get("rewritten_queries"), list) else []
             if not rewritten_queries:
@@ -134,7 +134,6 @@ class ResearcherAgent:
 
             except Exception as exc:
                 result["error"] = str(exc)
-                result["last_error"] = str(exc)
                 self.ctx.log_task(task_id, "Query failed.", level="error", stage="researcher", query=query, error=str(exc))
                 task_updates[task_key] = result
 
@@ -164,7 +163,7 @@ class ResearcherAgent:
                 async def fetch_one(q):
                     async with semaphore:
                         source_types = task.get("source_types", [])
-                        verticals = task.get("source_strategy", [])
+                        verticals = task.get("verticals", [])
                         return await self._search_service.search(session, q, profile, verticals=verticals, source_types=source_types)
 
                 batches = await asyncio.gather(*(fetch_one(q) for q in queries), return_exceptions=True)
@@ -439,15 +438,6 @@ class _RetrievalHelper:
 
     @staticmethod
     def _dedupe_text_values(values: List[str]) -> List[str]:
-        seen = set()
-        output = []
-        for value in values:
-            cleaned = str(value or "").strip()
-            if not cleaned:
-                continue
-            lowered = cleaned.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            output.append(cleaned)
-        return output
+        # Shim → :func:`agents.base.dedupe_preserving_order`.
+        from .base import dedupe_preserving_order
+        return dedupe_preserving_order(values)

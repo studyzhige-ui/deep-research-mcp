@@ -56,11 +56,11 @@ def build_graph(service: "DeepResearchService"):
 
         execution_plan = state.get("execution_plan") or {}
         if not isinstance(execution_plan, dict) or not execution_plan.get("query_strategy"):
-            output_language = infer_user_language(state.get("topic", ""), state.get("user_feedback", ""))
+            output_language = infer_user_language(state.get("topic", ""), state.get("plan_adjustments", ""))
             execution_plan = planner.normalize_execution_plan(
                 {},
                 topic=topic,
-                background_intent=str(state.get("user_feedback") or state.get("approved_plan") or topic),
+                background_intent=str(state.get("plan_adjustments") or state.get("approved_plan") or topic),
                 reconnaissance=state.get("reconnaissance") if isinstance(state.get("reconnaissance"), dict) else {},
                 output_language=output_language,
             )
@@ -318,7 +318,6 @@ def build_graph(service: "DeepResearchService"):
         follow_up_tasks: List[SubTask] = []
         section_reviews: List[Dict[str, Any]] = []
         section_digests: List[SectionDigest] = []
-        all_missing: List[str] = []
 
         review_semaphore = asyncio.Semaphore(max(1, service.settings.reflector_review_concurrency))
         stagger = max(0.0, float(service.settings.reflector_review_stagger_seconds))
@@ -348,7 +347,6 @@ def build_graph(service: "DeepResearchService"):
             review = out["review"]
             section_reviews.append(review)
             section_digests.append(out["digest"])
-            all_missing.extend(review.get("missing_questions", []))
 
             for req in review.get("follow_up_requests", []):
                 if isinstance(req, dict):
@@ -420,7 +418,6 @@ def build_graph(service: "DeepResearchService"):
                 "sub_tasks": follow_up_tasks,  # Reducer merges these into existing
                 "quality_review": quality_review,
                 "section_digests": section_digests,
-                "conflicts": list(dict.fromkeys(all_missing)),
                 "previous_coverage": current_coverage,
                 "saturation_score": saturation,
             }
@@ -430,14 +427,15 @@ def build_graph(service: "DeepResearchService"):
                               follow_up_count=0, route_to="outline_builder", saturation=saturation)
         service.log_task(task_id, "Reflector routed to evidence outline builder.", stage="reflector",
                          reason=stop_reason, saturation=saturation)
+        # ``stop_reason`` is intentionally not surfaced into state — it is
+        # already captured in ``quality_review.reason`` above, which is
+        # persisted and shown to the user. Avoid plumbing a second copy.
         return {
             "route_to": "outline_builder",
             "quality_review": quality_review,
             "section_digests": section_digests,
-            "conflicts": list(dict.fromkeys(all_missing)),
             "previous_coverage": current_coverage,
             "saturation_score": saturation,
-            "early_stop_reason": stop_reason,
         }
 
     # ────────────────────────────────────────────────────────

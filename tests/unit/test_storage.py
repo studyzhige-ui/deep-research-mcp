@@ -85,3 +85,25 @@ async def test_progress_events_filtered_from_normal_events(store):
 
 async def test_ping_returns_true_on_healthy_store(store):
     assert await store.ping() is True
+
+
+async def test_list_tasks_with_meta_filters_and_orders(store):
+    await store.save_task_meta("a", {"topic": "alpha", "lifecycle": "running", "stage": "writer"})
+    await asyncio.sleep(0.01)
+    await store.save_task_meta("b", {"topic": "beta", "lifecycle": "completed", "stage": "completed"})
+    await asyncio.sleep(0.01)
+    await store.save_task_meta("c", {"topic": "gamma", "lifecycle": "running", "stage": "researcher"})
+
+    # Most-recently updated first, no filter
+    all_rows = await store.list_tasks_with_meta(limit=10)
+    assert [r["task_id"] for r in all_rows] == ["c", "b", "a"]
+    assert all_rows[0]["topic"] == "gamma"
+    assert all_rows[1]["lifecycle"] == "completed"
+
+    # Filter by lifecycle
+    running = await store.list_tasks_with_meta(limit=10, lifecycle="running")
+    assert [r["task_id"] for r in running] == ["c", "a"]
+
+    # Limit clamps to >= 1
+    limited = await store.list_tasks_with_meta(limit=0)
+    assert len(limited) == 1

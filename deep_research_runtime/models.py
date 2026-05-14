@@ -30,7 +30,13 @@ def _merge_sub_tasks(left: List["SubTask"], right: List["SubTask"]) -> List["Sub
 
 
 def _merge_section_results(left: List[Dict[str, Any]], right: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Reducer for section_results: simple append-merge from parallel Send() nodes."""
+    """Reducer for section_results: simple append-merge from parallel Send() nodes.
+
+    Asymmetric with ``_merge_sub_tasks`` on purpose: ``section_results`` is a
+    transient aggregation buffer that the ``collect_results`` node clears at
+    the end of every cycle, so deduplication has no value here. The simple
+    append matches LangGraph's default for ``operator.add`` reducers.
+    """
     return (left or []) + (right or [])
 
 
@@ -53,13 +59,15 @@ class SubTask(TypedDict, total=False):
     error: str
     result_count: int
     searched_urls: List[str]
-    # Error recovery fields
-    retry_count: int
-    last_error: str
+    # Reason recorded by the researcher when a task ends in the ``degraded``
+    # state (no documents / no evidence / no cards). Read by the reviewer to
+    # surface degraded-coverage notes back to the user.
     degradation_reason: str
-    source_strategy: List[str]
+    # Search routing knobs: verticals (Tavily/Exa/Bocha/etc.) and source-kind
+    # filters. Populated by the planner from the execution plan's query
+    # strategy and consumed by the researcher when calling search_service.
+    verticals: List[str]
     source_types: List[str]
-    extraction_fields: List[str]
 
 
 class SectionPlan(TypedDict, total=False):
@@ -184,16 +192,24 @@ class SectionResearchInput(TypedDict, total=False):
 class ResearchState(TypedDict, total=False):
     task_id: str
     topic: str
+    # ``approved_plan`` is the *human-facing rendered* execution plan text
+    # shown to the user during the draft step. It is preserved on the state
+    # solely so language inference and replanning prompts have the user-
+    # visible context to fall back on. The structured payload that drives
+    # report generation is ``plan_data`` (populated by the outline builder).
     approved_plan: str
     plan_data: Dict[str, object]
     execution_plan: ResearchExecutionPlan
     reconnaissance: ReconnaissanceResult
     evidence_outline: EvidenceOutline
-    user_feedback: str
+    # Free-text adjustments the user attached when approving the plan.
+    # Treated as supplemental ``background_intent`` for any planner
+    # re-normalization triggered after approval (see graph.py supervisor).
+    # Empty string when the user approved without comments.
+    plan_adjustments: str
     sub_tasks: Annotated[List[SubTask], _merge_sub_tasks]
     knowledge_cards: Annotated[List[KnowledgeCard], operator.add]
     section_digests: List[SectionDigest]
-    conflicts: List[str]
     # Cross-source conflicts surfaced by conflict_detector.py.
     # Sparse map ``{section_id: [ConflictRecord, ...]}`` — sections without
     # detected conflicts are absent rather than mapped to an empty list, so
@@ -216,6 +232,5 @@ class ResearchState(TypedDict, total=False):
     previous_coverage: float
     cards_before_loop: int
     saturation_score: float
-    early_stop_reason: str
     # Section-level parallel research (Send API)
     section_results: Annotated[List[Dict[str, Any]], _merge_section_results]

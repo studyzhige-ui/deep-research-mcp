@@ -69,6 +69,10 @@ class DeepResearchService(ToolsMixin, RuntimeMixin):
         self._worker_result_lock = asyncio.Lock()
         self._model_worker_log_path: Optional[str] = None
         self._graph_init_lock = asyncio.Lock()
+        # One-shot guard for the orphan-task sweep — runs the first time the
+        # graph is initialized after server start, never again during the
+        # lifetime of this process.
+        self._orphan_sweep_done = False
 
         # ── Filesystem ──
         self.ensure_report_dir()
@@ -136,6 +140,51 @@ class DeepResearchService(ToolsMixin, RuntimeMixin):
                 self._graph_checkpoint_connection = await aiosqlite.connect(str(self._graph_checkpoint_path))
             self.graph_checkpointer = AsyncSqliteSaver(self._graph_checkpoint_connection)
             self.app_engine = build_graph(self)
+            # One-shot sweep on first graph init: any task marked
+            # ``lifecycle=running`` in the registry that doesn't have a
+            # matching in-memory ``asyncio.Task`` is necessarily a corpse
+            # from a previous server process (this process can't possibly
+            # be running anything yet — _active_background_tasks is empty
+            # until tools.py creates one). Mark them failed so the user
+            # doesn't see them stuck forever.
+            if not self._orphan_sweep_done:
+                self._orphan_sweep_done = True
+                try:
+                    await self._sweep_orphan_running_tasks()
+                except Exception as exc:  # noqa: BLE001
+                    # Sweep is best-effort — never block graph startup on it
+                    logging.getLogger("DeepResearchMCP").warning(
+                        "Orphan-task sweep failed: %s", exc,
+                    )
+
+    async def _sweep_orphan_running_tasks(self) -> None:
+        """Mark stale ``lifecycle=running`` rows as ``failed`` on startup.
+
+        Background research tasks live in ``self._active_background_tasks``,
+        which is an in-memory dict. If the server is killed mid-run, the
+        registry keeps ``lifecycle=running`` forever — there is no way for
+        a fresh process to resume those tasks (LangGraph checkpoints record
+        graph state, not the asyncio task that was driving it).
+
+        This sweep finds those orphans and transitions them to ``failed``
+        with ``error_code=server_restart_orphan`` so clients see a clean
+        terminal state and can choose to retry or drop the task.
+        """
+        rows = await self.store.list_tasks_with_meta(limit=500, lifecycle="running")
+        if not rows:
+            return
+        active = set(self._active_background_tasks.keys())
+        for row in rows:
+            task_id = row["task_id"]
+            if task_id in active:
+                continue
+            await self.store.finalize_task(
+                task_id, "failed",
+                status_msg="Task was interrupted by a server restart.",
+                event_msg="Task marked failed by orphan sweep (server restarted while running).",
+                error="server restarted while task was running",
+                error_code="server_restart_orphan",
+            )
 
     # ── Shutdown ──
 

@@ -55,20 +55,11 @@ WEAK_REFERENCE_DOMAIN_SUFFIXES = (".medium.com", ".csdn.net", ".sina.cn", ".sina
 class QualityMixin:
     @staticmethod
     def _dedupe_text_items(values: List[str], *, limit: int = 0) -> List[str]:
-        seen: set[str] = set()
-        output: List[str] = []
-        for value in values:
-            text = re.sub(r"\s+", " ", str(value or "").strip())
-            if not text:
-                continue
-            lowered = text.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            output.append(text)
-            if limit and len(output) >= limit:
-                break
-        return output
+        # Shim → :func:`agents.base.dedupe_preserving_order` with whitespace
+        # collapse. Preserved as a method to avoid churning the ~25 call
+        # sites in this file.
+        from .agents.base import dedupe_preserving_order
+        return dedupe_preserving_order(values, limit=limit, collapse_whitespace=True)
 
     @staticmethod
     def _clamp_score(value: Any, default: float = 0.0) -> float:

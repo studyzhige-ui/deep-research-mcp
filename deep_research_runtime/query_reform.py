@@ -111,16 +111,13 @@ def _parse_response(raw: Any) -> List[str]:
 
 
 def _dedupe_preserving_order(items: List[str]) -> List[str]:
-    """Drop case-insensitive duplicates while keeping the first occurrence."""
-    seen = set()
-    out: List[str] = []
-    for item in items:
-        key = item.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
+    """Drop case-insensitive duplicates while keeping the first occurrence.
+
+    Thin shim over :func:`agents.base.dedupe_preserving_order` — kept here so
+    call sites in this module don't have to import from the agents package.
+    """
+    from .agents.base import dedupe_preserving_order
+    return dedupe_preserving_order(items)
 
 
 async def reformulate_queries(
